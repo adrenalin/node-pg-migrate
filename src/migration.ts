@@ -33,6 +33,8 @@ export interface RunMigration {
 export const FilenameFormat = Object.freeze({
   timestamp: 'timestamp',
   utc: 'utc',
+  iso: 'iso',
+  index: 'index',
 });
 
 export type FilenameFormat =
@@ -49,6 +51,7 @@ export interface CreateOptionsDefault {
 
 export type CreateOptions = {
   filenameFormat?: FilenameFormat;
+  ignorePattern?: string;
 } & (CreateOptionsTemplate | CreateOptionsDefault);
 
 const SEPARATOR = '_';
@@ -97,7 +100,8 @@ interface LoadMigrationFilesOptions {
 
 /**
  * Reads files from `dir`, sorts them and returns an array of their absolute paths.
- * When not using globs, files are sorted by their numeric prefix values first. 17 digit numbers are interpreted as utc date and converted to the number representation of that date.
+ * When not using globs, files are sorted by their numeric prefix values first.
+ * 17 digit numbers are interpreted as utc date and converted to the number representation of that date.
  * Glob matches are sorted via String.localeCompare with ignored punctuation.
  *
  * @param dir The directory containing your migration files. This path is resolved from `cwd()`.
@@ -186,9 +190,14 @@ async function getLastSuffix(
   }
 }
 
+export const isoDateTimeMatch =
+  /^\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d:[0-5]\d(\.\d+)?([+-][0-2]\d:[0-5]\d|Z)?$/;
+
 /**
- * extracts numeric value from everything in `filename` before `SEPARATOR`.
+ * Extracts numeric value from everything in `filename` before `SEPARATOR`.
  * 17 digit numbers are interpreted as utc date and converted to the number representation of that date.
+ * Heuristics are used also to match ISO 8601 format.
+ *
  * @param filename filename to extract the prefix from
  * @param logger Redirect messages to this logger object, rather than `console`.
  * @returns numeric value of the filename prefix (everything before `SEPARATOR`).
@@ -219,7 +228,15 @@ export function getNumericPrefix(
     }
   }
 
-  logger.error(`Can't determine timestamp for ${prefix}`);
+  if (prefix && isoDateTimeMatch.test(prefix)) {
+    return new Date(prefix).valueOf();
+  }
+
+  if (prefix && /^\d{1,4$/) {
+    return Number(prefix);
+  }
+
+  logger.error(`Cannot determine numeric prefix for ${prefix}`);
   return Number(prefix) || 0;
 }
 
@@ -232,22 +249,72 @@ async function resolveSuffix(
 }
 
 export class Migration implements RunMigration {
+  /**
+   * Get file prefix for a new migrations file
+   *
+   * @method Migration.getFilePrefix
+   * @param filenameFormat Filename format
+   * @param directory Migrations directory
+   * @param [ignorePattern] Glob ignore pattern
+   * @returns string New file prefix
+   */
+  static async getFilePrefix(
+    filenameFormat: string,
+    directory: string,
+    ignorePattern?: string
+  ): Promise<string> {
+    if (filenameFormat === FilenameFormat.iso) {
+      return new Date().toISOString();
+    }
+
+    if (filenameFormat === FilenameFormat.index) {
+      const filePaths = await getMigrationFilePaths(directory, {
+        ignorePattern,
+        useGlob: /\*/.test(directory) || /\*/.test(ignorePattern || ''),
+      });
+
+      // Get the minimum last found prefix as the total number of matching files
+      let lastPrefix = filePaths.length;
+
+      // Index can be used only when there are no mismatching filenames, so all
+      // the filenames have to be verified first against "index" naming pattern
+      for (const filenamePath of filePaths) {
+        const filename = basename(filenamePath);
+        if (!/^\d{1,4}\D/.test(filename)) {
+          throw new Error(
+            `Cannot deduce index for previously created file "${filenamePath}"`
+          );
+        }
+
+        lastPrefix = Math.max(lastPrefix, getNumericPrefix(filename));
+      }
+
+      // Next prefix is one more than the last found prefix
+      return `${lastPrefix + 1}`.padStart(4, '0');
+    }
+
+    return filenameFormat === FilenameFormat.utc
+      ? new Date().toISOString().replace(/\D/g, '')
+      : Date.now().toString();
+  }
+
   // class method that creates a new migration file by cloning the migration template
   static async create(
     name: string,
     directory: string,
     options: CreateOptions = {}
   ): Promise<string> {
-    const { filenameFormat = FilenameFormat.timestamp } = options;
+    const { filenameFormat = FilenameFormat.timestamp, ignorePattern } =
+      options;
 
     // ensure the migrations directory exists
     await mkdir(directory, { recursive: true });
 
-    const now = new Date();
-    const time =
-      filenameFormat === FilenameFormat.utc
-        ? now.toISOString().replace(/\D/g, '')
-        : now.valueOf();
+    const prefix = await Migration.getFilePrefix(
+      filenameFormat,
+      directory,
+      ignorePattern
+    );
 
     const templateFileName =
       'templateFileName' in options
@@ -262,7 +329,7 @@ export class Migration implements RunMigration {
     const suffix = getSuffixFromFileName(templateFileName);
 
     // file name looks like migrations/1391877300255_migration-title.js
-    const newFile = join(directory, `${time}${SEPARATOR}${name}.${suffix}`);
+    const newFile = join(directory, `${prefix}${SEPARATOR}${name}.${suffix}`);
 
     // copy the default migration template to the new file location
     await new Promise<void>((resolve, reject) => {
